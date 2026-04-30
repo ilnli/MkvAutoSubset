@@ -8,6 +8,7 @@ import (
 	"golang.org/x/image/font"
 	"golang.org/x/image/math/fixed"
 	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/traditionalchinese"
 )
 
 // These constants are not part of the specifications, but are limitations used
@@ -1789,6 +1790,8 @@ func (f *Font) Name(b *Buffer, id NameID) ([]string, error) {
 			continue
 		case pidMacintosh<<16 | psidMacintoshRoman:
 			stringify = stringifyMacintosh
+		case pidMacintosh<<16 | psidMacintoshTraditionalChinese:
+			stringify = stringifyMacintoshTraditionalChinese
 		case pidWindows<<16 | psidWindowsUCS2:
 			stringify = stringifyUCS2
 		}
@@ -1819,11 +1822,31 @@ func stringifyMacintosh(b []byte) (string, error) {
 		if c >= 0x80 {
 			// b contains some non-ASCII bytes.
 			s, _ := charmap.Macintosh.NewDecoder().Bytes(b)
+			if big5, err := stringifyMacintoshTraditionalChinese(b); err == nil && containsCJK(big5) && !containsCJK(string(s)) {
+				return big5, nil
+			}
 			return string(s), nil
 		}
 	}
 	// b contains only ASCII bytes.
 	return string(b), nil
+}
+
+func stringifyMacintoshTraditionalChinese(b []byte) (string, error) {
+	s, err := traditionalchinese.Big5.NewDecoder().Bytes(b)
+	if err != nil {
+		return "", err
+	}
+	return string(s), nil
+}
+
+func containsCJK(s string) bool {
+	for _, r := range s {
+		if (r >= 0x3400 && r <= 0x9fff) || (r >= 0xf900 && r <= 0xfaff) {
+			return true
+		}
+	}
+	return false
 }
 
 func stringifyUCS2(b []byte) (string, error) {

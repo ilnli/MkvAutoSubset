@@ -21,7 +21,8 @@ const (
 	// for the Unicode Platform ID (value 0). See
 	// https://github.com/fontforge/fontforge/issues/2728
 
-	psidMacintoshRoman = 0
+	psidMacintoshRoman              = 0
+	psidMacintoshTraditionalChinese = 2
 
 	psidWindowsSymbol = 0
 	psidWindowsUCS2   = 1
