@@ -4,7 +4,7 @@ package c
 #include <stdlib.h>
 #include <stdbool.h>
 
-bool subset(char *oldpath, int idx, char *newpath, const char *newname, const char *dest, const char *txt);
+bool subset(char *oldpath, int idx, char *newpath, const char *newname, const char *dest, const char *txt, const char *cps, const char *glyphs);
 bool ass2pgs(char *ass, const char *resolution, const char *rate, char *fontdir, char *output);
 */
 import "C"
@@ -12,7 +12,7 @@ import (
 	"unsafe"
 )
 
-func Subset(oldpath string, idx int, newpath, newname, dest, txt string) bool {
+func Subset(oldpath string, idx int, newpath, newname, dest, txt, cps, glyphs string) bool {
 	cOldpath := C.CString(oldpath)
 	defer C.free(unsafe.Pointer(cOldpath))
 	cNewpath := C.CString(newpath)
@@ -23,8 +23,12 @@ func Subset(oldpath string, idx int, newpath, newname, dest, txt string) bool {
 	defer C.free(unsafe.Pointer(cNewname))
 	cTxt := C.CString(txt)
 	defer C.free(unsafe.Pointer(cTxt))
+	cCps := C.CString(cps)
+	defer C.free(unsafe.Pointer(cCps))
+	cGlyphs := C.CString(glyphs)
+	defer C.free(unsafe.Pointer(cGlyphs))
 
-	return bool(C.subset(cOldpath, C.int(idx), cNewpath, cNewname, cDest, cTxt))
+	return bool(C.subset(cOldpath, C.int(idx), cNewpath, cNewname, cDest, cTxt, cCps, cGlyphs))
 }
 
 func Ass2Pgs(input string, resolution, frameRate, fontsDir, output string) bool {

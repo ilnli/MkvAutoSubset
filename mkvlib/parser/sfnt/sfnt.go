@@ -603,6 +603,7 @@ type Font struct {
 		finalTableOffset int32
 		glyphData        glyphData
 		glyphIndex       glyphIndexFunc
+		cmapCodepoint    cmapCodepointFunc
 		bounds           [4]int16
 		descent          int32
 		indexToLocFormat bool // false means short, true means long.
@@ -655,7 +656,7 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	if err != nil {
 		return err
 	}
-	buf, glyphIndex, err := f.parseCmap(buf)
+	buf, glyphIndex, cmapCodepoint, err := f.parseCmap(buf)
 	if err != nil {
 		return err
 	}
@@ -689,6 +690,7 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	f.cached.finalTableOffset = finalTableOffset
 	f.cached.glyphData = glyphData
 	f.cached.glyphIndex = glyphIndex
+	f.cached.cmapCodepoint = cmapCodepoint
 	f.cached.bounds = bounds
 	f.cached.descent = descent
 	f.cached.indexToLocFormat = indexToLocFormat
@@ -825,50 +827,47 @@ func (f *Font) initializeTables(offset int, isDfont bool) (buf1 []byte, finalTab
 	return buf, finalTableOffset, isPostScript, nil
 }
 
-func (f *Font) parseCmap(buf []byte) (buf1 []byte, glyphIndex glyphIndexFunc, err error) {
+func (f *Font) parseCmap(buf []byte) (buf1 []byte, glyphIndex glyphIndexFunc, cmapCodepoint cmapCodepointFunc, err error) {
 	// https://www.microsoft.com/typography/OTSPEC/cmap.htm
 
 	const headerSize, entrySize = 4, 8
 	if f.cmap.length < headerSize {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 	u, err := f.src.u16(buf, f.cmap, 2)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	numSubtables := int(u)
 	if f.cmap.length < headerSize+entrySize*uint32(numSubtables) {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 
-	var (
-		bestWidth  int
-		bestOffset uint32
-		bestLength uint32
-		bestFormat uint16
-	)
+	subtables := make([]cmapSubtable, 0, numSubtables)
+	bestIndex := -1
+	bestWidth := 0
 
 	// Scan all of the subtables, picking the widest supported one. See the
 	// platformEncodingWidth comment for more discussion of width.
 	for i := 0; i < numSubtables; i++ {
 		buf, err = f.src.view(buf, int(f.cmap.offset)+headerSize+entrySize*i, entrySize)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		pid := u16(buf)
 		psid := u16(buf[2:])
-		width := platformEncodingWidth(pid, psid)
-		if width <= bestWidth {
+		width, encode, legacyEncoded := platformEncoding(pid, psid)
+		if width == 0 {
 			continue
 		}
 		offset := u32(buf[4:])
 
 		if offset > f.cmap.length-4 {
-			return nil, nil, errInvalidCmapTable
+			return nil, nil, nil, errInvalidCmapTable
 		}
 		buf, err = f.src.view(buf, int(f.cmap.offset+offset), 4)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		format := u16(buf)
 		if !supportedCmapFormat(format, pid, psid) {
@@ -876,16 +875,65 @@ func (f *Font) parseCmap(buf []byte) (buf1 []byte, glyphIndex glyphIndexFunc, er
 		}
 		length := uint32(u16(buf[2:]))
 
-		bestWidth = width
-		bestOffset = offset
-		bestLength = length
-		bestFormat = format
+		subtables = append(subtables, cmapSubtable{
+			pid:           pid,
+			psid:          psid,
+			format:        format,
+			offset:        offset,
+			length:        length,
+			width:         width,
+			encode:        encode,
+			legacyEncoded: legacyEncoded,
+		})
+		if !legacyEncoded && width > bestWidth {
+			bestWidth = width
+			bestIndex = len(subtables) - 1
+		}
 	}
 
-	if bestWidth == 0 {
-		return nil, nil, errUnsupportedCmapEncodings
+	if len(subtables) == 0 {
+		return nil, nil, nil, errUnsupportedCmapEncodings
 	}
-	return f.makeCachedGlyphIndex(buf, bestOffset, bestLength, bestFormat)
+	if bestIndex < 0 {
+		bestIndex = 0
+	}
+
+	addMapping := func(mappings []cmapMapping, subtable cmapSubtable) ([]byte, []cmapMapping, error) {
+		var fn glyphIndexFunc
+		var err error
+		buf, fn, err = f.makeCachedGlyphIndex(buf, subtable.offset, subtable.length, subtable.format)
+		if err != nil {
+			return nil, mappings, err
+		}
+		return buf, append(mappings, cmapMapping{glyphIndex: fn, encode: subtable.encode}), nil
+	}
+
+	mappings := make([]cmapMapping, 0, len(subtables))
+	buf, mappings, err = addMapping(mappings, subtables[bestIndex])
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for i, subtable := range subtables {
+		if i == bestIndex || !subtable.legacyEncoded {
+			continue
+		}
+		var next []cmapMapping
+		var nextBuf []byte
+		nextBuf, next, err = addMapping(mappings, subtable)
+		if err == nil {
+			buf = nextBuf
+			mappings = next
+		}
+	}
+
+	glyphIndex = func(f *Font, b *Buffer, r rune) (GlyphIndex, error) {
+		_, g, err := lookupCmapCodepoint(mappings, f, b, r)
+		return g, err
+	}
+	cmapCodepoint = func(f *Font, b *Buffer, r rune) (rune, GlyphIndex, error) {
+		return lookupCmapCodepoint(mappings, f, b, r)
+	}
+	return buf, glyphIndex, cmapCodepoint, nil
 }
 
 func (f *Font) parseHead(buf []byte) (buf1 []byte, bounds [4]int16, indexToLocFormat bool, unitsPerEm Units, err error) {
@@ -1326,6 +1374,24 @@ func (f *Font) Bounds(b *Buffer, ppem fixed.Int26_6, h font.Hinting) (fixed.Rect
 // style' numerals, and users can direct software to choose a variant.
 
 type glyphIndexFunc func(f *Font, b *Buffer, r rune) (GlyphIndex, error)
+type cmapCodepointFunc func(f *Font, b *Buffer, r rune) (rune, GlyphIndex, error)
+
+func lookupCmapCodepoint(mappings []cmapMapping, f *Font, b *Buffer, r rune) (rune, GlyphIndex, error) {
+	for _, mapping := range mappings {
+		c, ok := mapping.encode(r)
+		if !ok {
+			continue
+		}
+		g, err := mapping.glyphIndex(f, b, c)
+		if err != nil {
+			return 0, 0, err
+		}
+		if g != 0 {
+			return c, g, nil
+		}
+	}
+	return r, 0, nil
+}
 
 // GlyphIndex returns the glyph index for the given rune.
 //
@@ -1336,6 +1402,14 @@ type glyphIndexFunc func(f *Font, b *Buffer, r rune) (GlyphIndex, error)
 // representing a missing character, commonly known as .notdef."
 func (f *Font) GlyphIndex(b *Buffer, r rune) (GlyphIndex, error) {
 	return f.cached.glyphIndex(f, b, r)
+}
+
+// CmapCodepoint returns the cmap codepoint that maps r to a glyph.
+//
+// For Unicode cmaps this is usually r. For legacy-encoded cmaps, such as Big5,
+// it can be a font-encoding codepoint that is not the Unicode scalar value.
+func (f *Font) CmapCodepoint(b *Buffer, r rune) (rune, GlyphIndex, error) {
+	return f.cached.cmapCodepoint(f, b, r)
 }
 
 func (f *Font) viewGlyphData(b *Buffer, x GlyphIndex) (buf []byte, offset, length uint32, err error) {

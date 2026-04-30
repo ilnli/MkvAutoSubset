@@ -6,6 +6,7 @@ package sfnt
 
 import (
 	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/traditionalchinese"
 )
 
 // Platform IDs and Platform Specific IDs as per
@@ -26,8 +27,47 @@ const (
 
 	psidWindowsSymbol = 0
 	psidWindowsUCS2   = 1
+	psidWindowsBig5   = 4
 	psidWindowsUCS4   = 10
 )
+
+type cmapRuneEncoder func(rune) (rune, bool)
+
+type cmapMapping struct {
+	glyphIndex glyphIndexFunc
+	encode     cmapRuneEncoder
+}
+
+type cmapSubtable struct {
+	pid, psid     uint16
+	format        uint16
+	offset        uint32
+	length        uint32
+	width         int
+	encode        cmapRuneEncoder
+	legacyEncoded bool
+}
+
+func encodeIdentity(r rune) (rune, bool) {
+	return r, true
+}
+
+func encodeMacintoshRoman(r rune) (rune, bool) {
+	x, ok := charmap.Macintosh.EncodeRune(r)
+	return rune(x), ok
+}
+
+func encodeBig5(r rune) (rune, bool) {
+	b, err := traditionalchinese.Big5.NewEncoder().Bytes([]byte(string(r)))
+	if err != nil || len(b) == 0 || len(b) > 2 {
+		return 0, false
+	}
+	x := rune(0)
+	for _, c := range b {
+		x = x<<8 | rune(c)
+	}
+	return x, true
+}
 
 // platformEncodingWidth returns the number of bytes per character assumed by
 // the given Platform ID and Platform Specific ID.
@@ -44,32 +84,41 @@ const (
 // greater compatibility with older software, or because the resultant file
 // size can be smaller.
 func platformEncodingWidth(pid, psid uint16) int {
+	width, _, _ := platformEncoding(pid, psid)
+	return width
+}
+
+func platformEncoding(pid, psid uint16) (int, cmapRuneEncoder, bool) {
 	switch pid {
 	case pidUnicode:
 		switch psid {
 		case psidUnicode2BMPOnly:
-			return 2
+			return 2, encodeIdentity, false
 		case psidUnicode2FullRepertoire:
-			return 4
+			return 4, encodeIdentity, false
 		}
 
 	case pidMacintosh:
 		switch psid {
 		case psidMacintoshRoman:
-			return 1
+			return 1, encodeMacintoshRoman, false
+		case psidMacintoshTraditionalChinese:
+			return 2, encodeBig5, true
 		}
 
 	case pidWindows:
 		switch psid {
 		case psidWindowsSymbol:
-			return 2
+			return 2, encodeIdentity, false
 		case psidWindowsUCS2:
-			return 2
+			return 2, encodeIdentity, false
+		case psidWindowsBig5:
+			return 2, encodeBig5, true
 		case psidWindowsUCS4:
-			return 4
+			return 4, encodeIdentity, false
 		}
 	}
-	return 0
+	return 0, nil, false
 }
 
 // The various cmap formats are described at
@@ -79,6 +128,9 @@ var supportedCmapFormat = func(format, pid, psid uint16) bool {
 	switch format {
 	case 0:
 		return pid == pidMacintosh && psid == psidMacintoshRoman
+	case 2:
+		return (pid == pidMacintosh && psid == psidMacintoshTraditionalChinese) ||
+			(pid == pidWindows && psid == psidWindowsBig5)
 	case 4:
 		return true
 	case 6:
@@ -93,6 +145,8 @@ func (f *Font) makeCachedGlyphIndex(buf []byte, offset, length uint32, format ui
 	switch format {
 	case 0:
 		return f.makeCachedGlyphIndexFormat0(buf, offset, length)
+	case 2:
+		return f.makeCachedGlyphIndexFormat2(buf, offset, length)
 	case 4:
 		return f.makeCachedGlyphIndexFormat4(buf, offset, length)
 	case 6:
@@ -115,12 +169,81 @@ func (f *Font) makeCachedGlyphIndexFormat0(buf []byte, offset, length uint32) ([
 	var table [256]byte
 	copy(table[:], buf[6:])
 	return buf, func(f *Font, b *Buffer, r rune) (GlyphIndex, error) {
-		x, ok := charmap.Macintosh.EncodeRune(r)
-		if !ok {
-			// The source rune r is not representable in the Macintosh-Roman encoding.
+		if r < 0 || r > 0xff {
 			return 0, nil
 		}
-		return GlyphIndex(table[x]), nil
+		return GlyphIndex(table[byte(r)]), nil
+	}, nil
+}
+
+func (f *Font) makeCachedGlyphIndexFormat2(buf []byte, offset, length uint32) ([]byte, glyphIndexFunc, error) {
+	const headerSize = 6
+	const subHeaderKeysSize = 512
+	const subHeaderSize = 8
+	if length < headerSize+subHeaderKeysSize || offset+length > f.cmap.length {
+		return nil, nil, errInvalidCmapTable
+	}
+	var err error
+	buf, err = f.src.view(buf, int(f.cmap.offset+offset), int(length))
+	if err != nil {
+		return nil, nil, err
+	}
+	if uint32(u16(buf[2:])) != length {
+		return nil, nil, errInvalidCmapTable
+	}
+
+	subHeaderKeys := make([]uint16, 256)
+	maxKey := uint16(0)
+	for i := range subHeaderKeys {
+		key := u16(buf[headerSize+2*i:])
+		if key%subHeaderSize != 0 {
+			return nil, nil, errInvalidCmapTable
+		}
+		subHeaderKeys[i] = key
+		if key > maxKey {
+			maxKey = key
+		}
+	}
+
+	subHeadersOffset := headerSize + subHeaderKeysSize
+	subHeaderCount := int(maxKey/subHeaderSize) + 1
+	if subHeadersOffset+subHeaderCount*subHeaderSize > len(buf) {
+		return nil, nil, errInvalidCmapTable
+	}
+
+	return buf, func(f *Font, b *Buffer, r rune) (GlyphIndex, error) {
+		if r < 0 || r > 0xffff {
+			return 0, nil
+		}
+		c := uint16(r)
+		hi := byte(c >> 8)
+		lo := byte(c)
+		key := subHeaderKeys[hi]
+		if hi != 0 && key == 0 {
+			return 0, nil
+		}
+
+		subHeaderOffset := subHeadersOffset + int(key)
+		firstCode := u16(buf[subHeaderOffset:])
+		entryCount := u16(buf[subHeaderOffset+2:])
+		idDelta := u16(buf[subHeaderOffset+4:])
+		idRangeOffset := u16(buf[subHeaderOffset+6:])
+		if uint16(lo) < firstCode || uint16(lo) >= firstCode+entryCount {
+			return 0, nil
+		}
+		if idRangeOffset == 0 {
+			return GlyphIndex(uint16(lo) + idDelta), nil
+		}
+
+		glyphOffset := subHeaderOffset + 6 + int(idRangeOffset) + 2*int(uint16(lo)-firstCode)
+		if glyphOffset+2 > len(buf) {
+			return 0, errInvalidCmapTable
+		}
+		glyph := u16(buf[glyphOffset:])
+		if glyph == 0 {
+			return 0, nil
+		}
+		return GlyphIndex(glyph + idDelta), nil
 	}, nil
 }
 
@@ -194,7 +317,11 @@ func (f *Font) makeCachedGlyphIndexFormat4(buf []byte, offset, length uint32) ([
 				if err != nil {
 					return 0, err
 				}
-				return GlyphIndex(u16(x)), nil
+				glyph := u16(x)
+				if glyph == 0 {
+					return 0, nil
+				}
+				return GlyphIndex(glyph + entry.delta), nil
 			}
 		}
 		return 0, nil

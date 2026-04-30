@@ -33,3 +33,15 @@ func TestStringifyMacintoshFallsBackToBig5(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+func TestEncodeBig5CmapCodepoint(t *testing.T) {
+	got, ok := encodeBig5('\u83ef')
+	if !ok {
+		t.Fatal("Big5 encode failed")
+	}
+
+	const want = 0xb5d8
+	if got != want {
+		t.Fatalf("got %#x, want %#x", got, want)
+	}
+}

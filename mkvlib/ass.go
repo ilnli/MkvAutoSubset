@@ -364,38 +364,42 @@ func (self *assProcessor) getFontsName(files []string) map[string][][]map[string
 	return _m
 }
 
+func loadSfntFont(file string, index int) (*sfnt.Font, bool) {
+	_f, err := openFile(file, true, false)
+	if err != nil {
+		return nil, false
+	}
+	defer func() { _ = _f.Close() }()
+	data, err := io.ReadAll(_f)
+	if err != nil {
+		return nil, false
+	}
+	if strings.HasSuffix(strings.ToLower(file), ".ttc") {
+		c, err := sfnt.ParseCollection(data)
+		if err != nil {
+			return nil, false
+		}
+		_font, err := c.Font(index)
+		return _font, err == nil
+	}
+	_font, err := sfnt.Parse(data)
+	return _font, err == nil
+}
+
 func (self *assProcessor) checkFontMissing(f *fontInfo, i int, c bool) bool {
 	_str := ""
-	_f, err := os.Open(f.file)
-	if err == nil {
-		defer func() { _ = _f.Close() }()
-		data, err := io.ReadAll(_f)
-		if err == nil {
-			var _font *sfnt.Font
-			if strings.HasSuffix(strings.ToLower(f.file), ".ttc") {
-				c, err := sfnt.ParseCollection(data)
-				if err == nil {
-					_font, _ = c.Font(f.index)
-				}
-			} else {
-				_font, _ = sfnt.Parse(data)
-			}
-			if _font != nil {
-				for _, r := range f.runes {
-					if r == '\u00a0' || r == '\u0009' {
-						continue
-					}
-					n, _ := _font.GlyphIndex(nil, r)
-					if n == 0 {
-						_str += string(r)
-					}
-				}
-			} else {
-				return false
-			}
-		}
-	} else {
+	_font, ok := loadSfntFont(f.file, f.index)
+	if !ok {
 		return false
+	}
+	for _, r := range f.runes {
+		if r == '\u00a0' || r == '\u0009' {
+			continue
+		}
+		n, _ := _font.GlyphIndex(nil, r)
+		if n == 0 {
+			_str += string(r)
+		}
 	}
 	h := "N"
 	if c {
@@ -406,6 +410,32 @@ func (self *assProcessor) checkFontMissing(f *fontInfo, i int, c bool) bool {
 		printLog(self.lcb, logWarning, `{%s%02d}Font [%s] -> "%s"[%d] missing char(s): "%s"`, h, i, f.matchedName, f.file, f.index, _str)
 	}
 	return _str == ""
+}
+
+func (self *assProcessor) subsetCodepoints(f *fontInfo) (string, string) {
+	_font, ok := loadSfntFont(f.file, f.index)
+	if !ok {
+		return "", ""
+	}
+	seenCodepoints := make(map[rune]bool)
+	seenGlyphs := make(map[sfnt.GlyphIndex]bool)
+	codepoints := make([]string, 0)
+	glyphs := make([]string, 0)
+	for _, r := range f.runes {
+		c, g, err := _font.CmapCodepoint(nil, r)
+		if err != nil || g == 0 {
+			c = r
+		}
+		if !seenCodepoints[c] {
+			seenCodepoints[c] = true
+			codepoints = append(codepoints, strconv.FormatInt(int64(c), 10))
+		}
+		if g != 0 && !seenGlyphs[g] {
+			seenGlyphs[g] = true
+			glyphs = append(glyphs, strconv.FormatInt(int64(g), 10))
+		}
+	}
+	return strings.Join(codepoints, ","), strings.Join(glyphs, ",")
 }
 
 func (self *assProcessor) matchFonts() []string {
@@ -602,6 +632,7 @@ func (self *assProcessor) createFontSubset(font *fontInfo) bool {
 	}
 	str := string(font.runes)
 	str = stringDeduplication(str)
+	cps, glyphs := self.subsetCodepoints(font)
 	n = font.newName
 	if !self.rename {
 		n = font.matchedName
@@ -609,7 +640,7 @@ func (self *assProcessor) createFontSubset(font *fontInfo) bool {
 	dest := "Processed by " + LibFName + " at " + time.Now().Format("2006-01-02 15:04:05")
 	fn := fmt.Sprintf("%s.%s%s", n, randomStr(8), e)
 	fn = path.Join(self.output, fn)
-	if !c.Subset(font.file, font.index, fn, n, dest, str) {
+	if !c.Subset(font.file, font.index, fn, n, dest, str, cps, glyphs) {
 		printLog(self.lcb, logError, `Failed to subset font: "%s"(%s)[%d].`, font.matchedName, font.file, font.index)
 		return false
 	}
