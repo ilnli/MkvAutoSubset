@@ -93,7 +93,7 @@ jobs:
         run: |
           $pathRoot = "$env:VCPKG_ROOT\installed\$env:VCPKG_DEFAULT_TRIPLET"
           $env:CGO_CFLAGS = "-I$pathRoot\include -DHB_EXPERIMENTAL_API -Os"
-          $env:CGO_LDFLAGS = "-L$pathRoot\lib -lharfbuzz-subset -lass -lpng -lfreetype -lharfbuzz -lfribidi -lzlib -lgdi32"
+          $env:CGO_LDFLAGS = "-L$pathRoot\lib -lharfbuzz-subset -lass -lpng -lfreetype -lharfbuzz -lfribidi -lz -lgdi32"
 
           New-Item -ItemType Directory -Force -Path build | Out-Null
           Push-Location mkvtool
