@@ -1,0 +1,112 @@
+name: Build Windows CLI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - next
+    paths:
+      - ".github/workflows/windows-cli-build.yml"
+      - "mkvlib/**"
+      - "mkvtool/**"
+      - "win-build.bat"
+  pull_request:
+    paths:
+      - ".github/workflows/windows-cli-build.yml"
+      - "mkvlib/**"
+      - "mkvtool/**"
+      - "win-build.bat"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows CLI
+    runs-on: windows-latest
+
+    env:
+      CGO_ENABLED: "1"
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_DEFAULT_TRIPLET: x64-mingw-static
+      VCPKG_BUILD_TYPE: Release
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache-dependency-path: |
+            mkvlib/go.mod
+            mkvtool/go.mod
+
+      - name: Set up MSYS2 MinGW
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            make
+
+      - name: Add MinGW to PATH
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Clone vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg $env:VCPKG_ROOT
+
+      - name: Restore vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VCPKG_ROOT }}\downloads
+            ${{ env.VCPKG_ROOT }}\installed
+            ${{ env.VCPKG_ROOT }}\packages
+          key: ${{ runner.os }}-vcpkg-mingw-${{ hashFiles('.github/workflows/windows-cli-build.yml', 'win-build.bat') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-mingw-
+
+      - name: Bootstrap vcpkg
+        run: |
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: Install native dependencies
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            fribidi `
+            "freetype[core,zlib,png]" `
+            "harfbuzz[core,experimental-api]" `
+            libass `
+            --triplet "$env:VCPKG_DEFAULT_TRIPLET"
+
+      - name: Build mkvtool.exe
+        run: |
+          $pathRoot = "$env:VCPKG_ROOT\installed\$env:VCPKG_DEFAULT_TRIPLET"
+          $env:CGO_CFLAGS = "-I$pathRoot\include -DHB_EXPERIMENTAL_API -Os"
+          $env:CGO_LDFLAGS = "-L$pathRoot\lib -lharfbuzz-subset -lass -lpng -lfreetype -lharfbuzz -lfribidi -lzlib -lgdi32"
+
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          Push-Location mkvtool
+          go build -mod=mod -ldflags="-s -w" -o ..\build\mkvtool.exe
+          Pop-Location
+
+      - name: Smoke test
+        run: |
+          .\build\mkvtool.exe version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mkvtool-windows-x64
+          path: build\mkvtool.exe
+          if-no-files-found: error
